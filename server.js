@@ -1,23 +1,28 @@
-// server.js
 import express from "express";
-import fetch from "node-fetch";
 import cors from "cors";
-import { URL } from "url";
+import path from "path";
+import { fileURLToPath } from "url";
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "64kb" }));
 
+// --- Static frontend hosting (public/index.html) ---
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+app.use(express.static(path.join(__dirname, "public")));
+
+// --- Simple block fingerprints (you can expand these) ---
 const BLOCK_FINGERPRINTS = [
   { name: "GoGuardian", patterns: ["goguardian", "blocked by goguardian", "ggrouter"] },
-  { name: "Securly", patterns: ["securly", "securly.com", "blocked by securly"] },
+  { name: "Securly", patterns: ["securly", "blocked by securly"] },
   { name: "Lightspeed", patterns: ["lightspeed systems", "relay.lightspeedsystems"] },
   { name: "iBoss", patterns: ["iboss", "iboss cloud"] },
   { name: "FortiGuard", patterns: ["fortiguard", "web filter"] },
   { name: "Cisco Umbrella", patterns: ["umbrella", "opendns", "domain blocked"] },
 ];
 
-function normalize(input) {
+function normalizeUrl(input) {
   let s = (input || "").trim();
   if (!s) throw new Error("Empty URL");
   if (!/^https?:\/\//i.test(s)) s = "https://" + s;
@@ -25,9 +30,9 @@ function normalize(input) {
   return u.toString();
 }
 
-async function tryFetch(url, method, timeoutMs = 7000) {
+async function tryFetch(url, method, timeoutMs = 8000) {
   const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
+  const t = setTimeout(() => controller.abort(), timeoutMs);
   const start = Date.now();
   try {
     const res = await fetch(url, {
@@ -35,64 +40,74 @@ async function tryFetch(url, method, timeoutMs = 7000) {
       redirect: "manual",
       signal: controller.signal,
       headers: {
-        "user-agent": "SchoolPolicyLinkChecker/1.0",
+        "user-agent": "SchoolPolicyLinkScanner/1.0",
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       },
     });
+
     const ms = Date.now() - start;
     const loc = res.headers.get("location");
     const ct = res.headers.get("content-type") || "";
+
     let bodySnippet = "";
     if (method === "GET") {
       const text = await res.text();
-      bodySnippet = text.slice(0, 4000);
+      bodySnippet = text.slice(0, 6000);
     }
+
     return {
       ok: true,
       status: res.status,
-      statusText: res.statusText,
-      headers: { location: loc, contentType: ct },
       ms,
+      headers: { location: loc, contentType: ct },
       bodySnippet,
     };
   } catch (e) {
     const ms = Date.now() - start;
     return { ok: false, error: String(e?.message || e), ms };
   } finally {
-    clearTimeout(id);
+    clearTimeout(t);
   }
 }
 
 function detectBlock(snippet) {
   const s = (snippet || "").toLowerCase();
+
   for (const fp of BLOCK_FINGERPRINTS) {
     if (fp.patterns.some(p => s.includes(p))) return fp.name;
   }
-  // Generic “blocked” page hints
-  const generic = ["access denied", "blocked", "content blocked", "this site is blocked", "policy", "filter"];
+
+  const generic = [
+    "access denied",
+    "this site is blocked",
+    "content blocked",
+    "blocked by policy",
+    "web page blocked",
+    "filter",
+    "policy",
+  ];
   if (generic.some(p => s.includes(p))) return "Generic filter page";
+
   return null;
 }
 
+// API endpoint the frontend calls
 app.post("/api/scan", async (req, res) => {
   try {
-    const target = normalize(req.body?.url);
+    const target = normalizeUrl(req.body?.url);
     const chain = [];
     let current = target;
 
-    // Try HEAD first (fast), then GET if needed
     for (let hop = 0; hop < 6; hop++) {
       const head = await tryFetch(current, "HEAD");
       chain.push({ url: current, method: "HEAD", ...head });
 
-      // Redirect?
       const loc = head.ok ? head.headers.location : null;
       if (loc && [301, 302, 303, 307, 308].includes(head.status)) {
         current = new URL(loc, current).toString();
         continue;
       }
 
-      // If HEAD fails or looks suspicious, try GET for snippet analysis
       const needGet = !head.ok || head.status >= 400 || !head.headers.contentType;
       if (needGet) {
         const get = await tryFetch(current, "GET");
@@ -101,8 +116,9 @@ app.post("/api/scan", async (req, res) => {
       break;
     }
 
-    // Analyze last GET snippet (or last entry)
-    const last = chain.slice().reverse().find(x => x.method === "GET") || chain[chain.length - 1];
+    const lastGet = chain.slice().reverse().find(x => x.method === "GET");
+    const last = lastGet || chain[chain.length - 1];
+
     const blockVendor = detectBlock(last?.bodySnippet || "");
 
     let verdict = "uncertain";
@@ -143,4 +159,6 @@ app.post("/api/scan", async (req, res) => {
   }
 });
 
-app.listen(3000, () => console.log("✅ Link scanner running on http://localhost:3000"));
+// Render port
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Link scanner running on port ${PORT}`));
